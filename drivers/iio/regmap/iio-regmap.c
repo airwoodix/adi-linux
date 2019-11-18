@@ -5,6 +5,31 @@
  * Copyright 2019 Analog Devices Inc.
  */
 
+ /* Possible register operations table:
+  * +----------+--------+-----------+--------+-------+
+  * |    OP      |  ADDR  |    MASK   |  VAL  | TIME |
+  * +------------------------------------------------+
+  * |    READ    |    X   |          |        |      |
+  * +------------------------------------------------+
+  * | READ_MASK  |   X    |     X    |        |      |
+  * +------------------------------------------------+
+  * | WAIT_MASK  |   X    |     X    |    X   |   X  |
+  * +------------------------------------------------+
+  * |  WAIT_MS   |        |          |        |   X  |
+  * +----------+--------+-----------+--------+-------+
+  * |   WRITE    |   X    |          |    X   |      |
+  * +----------+--------+-----------+--------+-------+
+  * | WRITE_MASK |   X    |     X    |    X   |      |
+  * +----------+--------+-----------+--------+-------+
+  * Wait times are defined in milliseconds:
+  * READ        -> read value at ADDR
+  * READ_MASK   -> read value at ADDR with MASK
+  * WAIT_MASK   -> wait TIME for ADDR value with MASK to become VAL
+  * WAIT_MS     -> wait TIME milliseconds
+  * WRTIE       -> write VAL at ADDR
+  * WRITE_MASK  -> write VAL at ADDR with MASK
+  */
+
 #include <linux/iio/iio.h>
 #include <linux/firmware.h>
 #include <linux/module.h>
@@ -12,6 +37,36 @@
 #include <linux/regmap.h>
 
 #include "iio-regmap.h"
+
+#define REG_OP_SIZE		20
+#define WAIT_POLL_TIME_US	1000
+
+enum iio_regmap_opcode {
+	IIO_REGMAP_READ,
+	IIO_REGMAP_READ_MASK,
+	IIO_REGMAP_WAIT_MASK,
+	IIO_REGMAP_WAIT_MS,
+	IIO_REGMAP_WRITE,
+	IIO_REGMAP_WRITE_MASK,
+};
+
+static char *iio_reg_op_map[] = {
+	[IIO_REGMAP_WAIT_MS] = "WAIT_MS",
+	[IIO_REGMAP_READ_MASK] = "READ_MASK",
+	[IIO_REGMAP_WRITE_MASK] = "WRITE_MASK",
+	[IIO_REGMAP_WAIT_MASK] = "WAIT_MASK",
+	[IIO_REGMAP_WRITE] = "WRITE",
+	[IIO_REGMAP_READ] = "READ",
+};
+
+struct iio_regmap_op {
+	enum iio_regmap_opcode	op;
+	unsigned int		addr;
+	unsigned int		mask;
+	unsigned int		val;
+	unsigned int		time;
+	unsigned int		dbg;
+};
 
 struct iio_regmap {
 	struct device *dev;
@@ -88,6 +143,229 @@ static const char *read_firmware(struct device *dev)
 	return reg_ops;
 }
 
+static struct iio_regmap_op *alloc_register_ops(struct device *dev,
+						const char *fw_reg_ops)
+{
+	const char *c;
+	unsigned int new_lines;
+	struct iio_regmap_op *reg_ops;
+
+	if (!fw_reg_ops)
+		return NULL;
+
+	new_lines = 0;
+	for (c = fw_reg_ops; *c != '\0'; c++)
+		if (*c == '\n')
+			new_lines++;
+	reg_ops = devm_kzalloc(dev, new_lines * sizeof(*reg_ops), GFP_KERNEL);
+	if (!reg_ops)
+		return NULL;
+
+	return reg_ops;
+}
+
+static int parse_read_op(struct device *dev, const char *reg_ops,
+			 struct iio_regmap_op *op, int line)
+{
+	int ret;
+
+	ret = sscanf(reg_ops, "%x,,,,%u", &op->addr, &op->dbg);
+	if (ret != 2) {
+		dev_err(dev, "Invalid READ op format, line: %d.", line);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int parse_read_mask_op(struct device *dev, const char *reg_ops,
+			      struct iio_regmap_op *op, int line)
+{
+	int ret;
+
+	ret = sscanf(reg_ops, "%x,%x,,,%u", &op->addr, &op->mask, &op->dbg);
+	if (ret != 3) {
+		dev_err(dev, "Invalid READ_MASK op format, line: %d.", line);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int parse_wait_mask_op(struct device *dev, const char *reg_ops,
+			      struct iio_regmap_op *op, int line)
+{
+	int ret;
+
+	ret = sscanf(reg_ops, "%x,%x,%x,%u,%u", &op->addr, &op->mask, &op->val,
+		     &op->time, &op->dbg);
+	if (ret != 5) {
+		dev_err(dev, "Invalid WAIT_MASK op format, line: %d.", line);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int parse_wait_op(struct device *dev, const char *reg_ops,
+			 struct iio_regmap_op *op, int line)
+{
+	int ret;
+
+	ret = sscanf(reg_ops, ",,,%u,%u", &op->time, &op->dbg);
+	if (ret != 2) {
+		dev_err(dev, "Invalid WAIT_MS op format, line: %d.", line);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int parse_write_op(struct device *dev, const char *reg_ops,
+			  struct iio_regmap_op *op, int line)
+{
+	int ret;
+
+	ret = sscanf(reg_ops, "%x,,%x,,%u", &op->addr, &op->val, &op->dbg);
+	if (ret != 3) {
+		dev_err(dev, "Invalid WRITE op format, line: %d.", line);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int parse_write_mask_op(struct device *dev, const char *reg_ops,
+			       struct iio_regmap_op *op, int line)
+{
+	int ret;
+
+	ret = sscanf(reg_ops, "%x,%x,%x,,%u", &op->addr, &op->mask, &op->val,
+		     &op->dbg);
+	if (ret != 4) {
+		dev_err(dev, "Invalid WRITE_MASK format, line: %d.", line);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int read_register_op(struct device *dev, const char *fw_reg_ops,
+			    struct iio_regmap_op *reg_op, unsigned int line)
+{
+	int ret = 0;
+
+	if (!fw_reg_ops || !reg_op)
+		return -EINVAL;
+
+	switch (reg_op->op) {
+	case IIO_REGMAP_READ:
+		ret = parse_read_op(dev, fw_reg_ops, reg_op, line);
+		break;
+	case IIO_REGMAP_READ_MASK:
+		ret = parse_read_mask_op(dev, fw_reg_ops, reg_op, line);
+		break;
+	case IIO_REGMAP_WAIT_MASK:
+		ret = parse_wait_mask_op(dev, fw_reg_ops, reg_op, line);
+		break;
+	case IIO_REGMAP_WAIT_MS:
+		ret = parse_wait_op(dev, fw_reg_ops, reg_op, line);
+		break;
+	case IIO_REGMAP_WRITE:
+		ret = parse_write_op(dev, fw_reg_ops, reg_op, line);
+		break;
+	case IIO_REGMAP_WRITE_MASK:
+		ret = parse_write_mask_op(dev, fw_reg_ops, reg_op, line);
+		break;
+	default:
+		dev_err(dev, "Invalid op at line: %d", line);
+		return -EINVAL;
+	}
+
+	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+
+static int regmap_cmd_to_opcode(const char *cmd)
+{
+	int i;
+	int op_code = -1;
+
+	for (i = IIO_REGMAP_READ; i <= IIO_REGMAP_WRITE_MASK; i++) {
+		if (!strcmp(cmd, iio_reg_op_map[i])) {
+			op_code = i;
+			break;
+		}
+	}
+	return op_code;
+}
+
+static int parse_register_ops(struct device *dev, const char *fw_reg_ops,
+			      struct iio_regmap_op *reg_ops)
+{
+	char parsed_cmd[REG_OP_SIZE];
+	char *reg_op_end;
+	unsigned int op_size = 0;
+	unsigned int line = 0;
+	int op_nr = 0;
+	int ret;
+	int op_code;
+
+	if (!fw_reg_ops || !reg_ops)
+		return -EINVAL;
+
+	while (*fw_reg_ops != '\0') {
+		reg_op_end = strchr(fw_reg_ops, ',');
+		op_size = reg_op_end - fw_reg_ops;
+		if (op_size > REG_OP_SIZE) {
+			dev_err(dev, "Invalid op size.");
+			return -EINVAL;
+		}
+
+		memset(parsed_cmd, 0, REG_OP_SIZE);
+		memcpy(parsed_cmd, fw_reg_ops, op_size);
+		fw_reg_ops = reg_op_end + 1;
+
+		op_code = regmap_cmd_to_opcode(parsed_cmd);
+		if (op_code > 0) {
+			reg_ops[op_nr].op = op_code;
+			ret = read_register_op(dev, fw_reg_ops,
+					       &reg_ops[op_nr], line);
+			if (ret < 0)
+				return ret;
+			op_nr++;
+		} else {
+			dev_err(dev, "Invalid cmd at line: %d", line);
+		}
+
+		fw_reg_ops = strchr(fw_reg_ops, '\n') + 1;
+		line++;
+	}
+
+	return op_nr;
+}
+
+/* Each line represents a register operation.
+ * OP,ADDRESS,MASK,VALUE,WAIT_US (see beginning of source file)
+ * Allocate an array of iio_regmap_op structs
+ * then parse each command stored the firmware file,
+ * finally run each command.
+ */
+static int interpret_register_ops(struct device *dev, struct regmap *regmap,
+				  const char *fw_reg_ops)
+{
+	struct iio_regmap_op *reg_ops;
+	int nr_ops;
+
+	reg_ops = alloc_register_ops(dev, fw_reg_ops);
+	if (!reg_ops) {
+		dev_err(dev, "Could not allocate registers array.");
+		return -1;
+	}
+
+	nr_ops = parse_register_ops(dev, fw_reg_ops, reg_ops);
+	if (nr_ops < 0)
+		return nr_ops;
+
+	return 0;
+}
+
 int iio_regmap_probe(struct device *dev, struct regmap *regmap,
 		     const char *name)
 {
@@ -120,6 +398,8 @@ int iio_regmap_probe(struct device *dev, struct regmap *regmap,
 		dev_err(dev, "read_firmware failed!\n");
 		return PTR_ERR(register_ops);
 	}
+
+	ret = interpret_register_ops(dev, regmap, register_ops);
 
 	return ret;
 }
