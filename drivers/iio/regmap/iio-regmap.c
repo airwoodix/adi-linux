@@ -39,7 +39,7 @@
 #include "iio-regmap.h"
 
 #define REG_OP_SIZE		20
-#define WAIT_POLL_TIME_US	1000
+#define WAIT_POLL_NR_TIMES	10
 
 enum iio_regmap_opcode {
 	IIO_REGMAP_READ,
@@ -341,6 +341,143 @@ static int parse_register_ops(struct device *dev, const char *fw_reg_ops,
 	return op_nr;
 }
 
+static int run_read_op(struct device *dev, struct regmap *regmap, bool use_mask,
+		       const struct iio_regmap_op *op)
+{
+	int ret;
+	unsigned int value;
+
+	ret = regmap_read(regmap, op->addr, &value);
+	if (ret < 0) {
+		dev_err(dev, "regmap_read failed, addr: %x", op->addr);
+		return ret;
+	}
+	if (use_mask)
+		value &= use_mask;
+	if (op->dbg)
+		dev_info(dev, "Register: [%x], value: [%x].", op->addr, value);
+	return 0;
+}
+
+static int run_wait_mask_op(struct device *dev, struct regmap *regmap,
+			    const struct iio_regmap_op *op)
+{
+	int ret;
+	unsigned int value;
+	unsigned int wait_time;
+	unsigned int wait_nr_times = WAIT_POLL_NR_TIMES;
+
+	wait_time = op->time % WAIT_POLL_NR_TIMES;
+	if (wait_time)
+		mdelay(wait_time);
+	wait_time = op->time / WAIT_POLL_NR_TIMES;
+
+	while (wait_nr_times != 0) {
+		if (wait_time)
+			mdelay(wait_time);
+
+		ret = regmap_read(regmap, op->addr, &value);
+		if (ret < 0) {
+			dev_err(dev, "%s failed", __func__);
+			return ret;
+		}
+
+		wait_nr_times--;
+		value &= op->mask;
+		if (value == op->val)
+			break;
+
+		if (wait_nr_times == 0) {
+			dev_err(dev,
+				"Invalid reg [%x] value:[%x], expected[%x]",
+				op->addr, value, op->val);
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+static int run_write_mask_op(struct device *dev, struct regmap *regmap,
+			     const struct iio_regmap_op *op)
+{
+	int ret;
+	unsigned int register_value;
+
+	udelay(op->time);
+	ret = regmap_read(regmap, op->addr, &register_value);
+	if (ret < 0) {
+		dev_err(dev, "regmap_read failed, addr: %x", op->addr);
+		return ret;
+	}
+
+	register_value &= ~op->mask;
+	register_value |= op->val;
+
+	ret = regmap_write(regmap, op->addr, op->val);
+	if (ret < 0) {
+		dev_err(dev, "regmap_write failed, addr: %x", op->addr);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int run_write_op(struct device *dev, struct regmap *regmap,
+			const struct iio_regmap_op *op)
+{
+	int ret;
+
+	ret = regmap_write(regmap, op->addr, op->val);
+	if (ret < 0) {
+		dev_err(dev, "regmap_write failed, addr: %x", op->addr);
+		return ret;
+	}
+	return 0;
+}
+
+static int iio_run_regmap_ops(struct device *dev, struct regmap *regmap,
+			      const struct iio_regmap_op *reg_ops,
+			      unsigned int nr_ops)
+{
+	const struct iio_regmap_op *reg_op = 0;
+	int ret = 0;
+
+	if (!reg_ops || !regmap)
+		return -EINVAL;
+
+	for (reg_op = reg_ops; reg_op < reg_ops + nr_ops; reg_op++) {
+		switch (reg_op->op) {
+		case IIO_REGMAP_READ:
+			ret = run_read_op(dev, regmap, false, reg_op);
+			break;
+		case IIO_REGMAP_READ_MASK:
+			ret = run_read_op(dev, regmap, true, reg_op);
+			break;
+		case IIO_REGMAP_WAIT_MASK:
+			ret = run_wait_mask_op(dev, regmap, reg_op);
+			break;
+		case IIO_REGMAP_WAIT_MS:
+			mdelay(reg_op->time);
+			break;
+		case IIO_REGMAP_WRITE:
+			ret = run_write_op(dev, regmap, reg_op);
+			break;
+		case IIO_REGMAP_WRITE_MASK:
+			ret = run_write_mask_op(dev, regmap, reg_op);
+			break;
+		default:
+			dev_err(dev, "Invalid op code: %d.", reg_op->op);
+			return -EINVAL;
+		}
+	}
+
+	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+
 /* Each line represents a register operation.
  * OP,ADDRESS,MASK,VALUE,WAIT_US (see beginning of source file)
  * Allocate an array of iio_regmap_op structs
@@ -363,7 +500,7 @@ static int interpret_register_ops(struct device *dev, struct regmap *regmap,
 	if (nr_ops < 0)
 		return nr_ops;
 
-	return 0;
+	return iio_run_regmap_ops(dev, regmap, reg_ops, nr_ops);
 }
 
 int iio_regmap_probe(struct device *dev, struct regmap *regmap,
